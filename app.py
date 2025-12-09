@@ -26,78 +26,93 @@ if 'df_caixa_unificado' not in st.session_state:
 
 def clean_currency(x):
     """Limpa valores monetários de R$ 1.234,56 ou 1,234.56 para float"""
-    if pd.isna(x) or x == '':
+    if pd.isna(x) or str(x).strip() == '':
         return 0.0
-    if isinstance(x, (int, float)):
-        return float(x)
-    if isinstance(x, str):
-        # Remove R$, espaços e caracteres estranhos
-        clean = x.replace('R$', '').replace(' ', '').strip()
-        # Se tiver vírgula e ponto, assume padrão brasileiro (1.000,00)
+    
+    clean = str(x).replace('R$', '').replace(' ', '').strip()
+    
+    try:
+        # Se for um número que já parece float (ex: 125.50)
+        if clean.replace('.', '', 1).isdigit():
+            return float(clean)
+            
+        # Padrão brasileiro (ponto milhar, virgula decimal)
         if ',' in clean and '.' in clean:
             clean = clean.replace('.', '').replace(',', '.')
-        # Se só tiver vírgula, troca por ponto
+        # Apenas vírgula (comum no excel BR)
         elif ',' in clean:
             clean = clean.replace(',', '.')
-        try:
-            return float(clean)
-        except:
-            return 0.0
-    return 0.0
+            
+        return float(clean)
+    except:
+        return 0.0
 
 def extract_os_code(text):
     """Extrai código da OS (ex: 001-67358-42)"""
     if not isinstance(text, str):
         return None
-    # Regex flexível para capturar 3 digitos - digitos - digitos
+    # Regex para capturar 3 digitos - digitos - digitos (ex: 001-67540-24)
+    # O replace remove espaços dentro do código se houver
     match = re.search(r'(\d{3}\s*-\s*\d+\s*-\s*\d+)', text)
     if match:
-        return match.group(1).replace(' ', '').strip() # Remove espaços internos se houver
+        return match.group(1).replace(' ', '').strip()
     return None
+
+# --- PROCESSAMENTO INTELIGENTE DE ARQUIVOS ---
+
+def find_header_row(file, content_lines):
+    """Encontra em qual linha está o cabeçalho DATA e VALOR"""
+    for i, line in enumerate(content_lines[:200]): # Olha apenas as primeiras 200 linhas
+        line_upper = line.upper()
+        # Regra: Tem que ter DATA e (VALOR ou VLR ou PAGTO) na mesma linha
+        if 'DATA' in line_upper and ('VALOR' in line_upper or 'VLR' in line_upper or 'PAGTO' in line_upper):
+            return i
+    return -1
+
+def detect_separator(header_line):
+    """Conta se tem mais vírgulas ou ponto-e-vírgulas"""
+    if header_line.count(';') > header_line.count(','):
+        return ';'
+    return ','
 
 def process_base_files(uploaded_files):
     dataframes = []
     
-    progress_bar = st.progress(0)
-    
-    for i, file in enumerate(uploaded_files):
+    for file in uploaded_files:
         try:
-            # Tenta ler como CSV padrão (pula 10 linhas)
+            # Tenta ler com separador ; pulando 10 linhas (Padrão Medself/Bradesco)
             file.seek(0)
             df = pd.read_csv(file, sep=';', skiprows=10, encoding='latin1', on_bad_lines='skip', engine='python')
             
-            # Se falhar ou vier vazio, tenta ler do começo (formato Externa)
-            if df.empty or 'Data' not in df.columns:
+            # Se a coluna Data não existir, pode ser o arquivo "Externa" que começa na linha 0
+            if 'Data' not in df.columns:
                 file.seek(0)
                 df = pd.read_csv(file, sep=';', encoding='latin1', on_bad_lines='skip', engine='python')
-            
-            # Normalização de Colunas
+
+            # Normalizar nomes das colunas
             df.columns = [c.strip() for c in df.columns]
             
-            # Identifica coluna de OS
             col_os = None
-            if 'Cod O.S.' in df.columns: col_os = 'Cod O.S.'
-            elif 'Detalhado' in df.columns: col_os = 'Detalhado'
-            
-            # Identifica coluna de Valor
             col_valor = None
+            
+            # Mapeamento de colunas da Base
+            if 'Cod O.S.' in df.columns: col_os = 'Cod O.S.'
+            elif 'Detalhado' in df.columns: col_os = 'Detalhado' # Arquivo Externa
+            
             if 'Valor' in df.columns: col_valor = 'Valor'
-            elif 'Lqd. Balc.' in df.columns: col_valor = 'Lqd. Balc.'
+            elif 'Lqd. Balc.' in df.columns: col_valor = 'Lqd. Balc.' # Arquivo Externa
             
             if col_os and col_valor:
-                # Limpeza e Padronização
                 df['OS_Formatada'] = df[col_os].astype(str).apply(lambda x: x.strip())
                 df['Valor_Base'] = df[col_valor].apply(clean_currency)
                 df['Arquivo_Origem'] = file.name
                 
-                # Filtra apenas linhas válidas
+                # Filtrar linhas válidas
                 df_valid = df[df['Valor_Base'] > 0].copy()
                 dataframes.append(df_valid[['OS_Formatada', 'Valor_Base', 'Arquivo_Origem']])
                 
         except Exception as e:
-            st.error(f"Erro ao ler base {file.name}: {e}")
-            
-        progress_bar.progress((i + 1) / len(uploaded_files))
+            st.error(f"Erro Base {file.name}: {e}")
             
     if dataframes:
         return pd.concat(dataframes, ignore_index=True)
@@ -107,76 +122,63 @@ def process_caixa_files(uploaded_files):
     dataframes = []
     errors = []
     
-    progress_bar = st.progress(0)
-
-    for i, file in enumerate(uploaded_files):
+    for file in uploaded_files:
         try:
-            # 1. Lê o arquivo como texto para achar o cabeçalho
+            # 1. Ler o arquivo como texto puro primeiro
             file.seek(0)
-            content_bytes = file.read()
-            # Tenta decodificar latin1 (padrão Excel BR)
             try:
-                content = content_bytes.decode('latin1')
+                content = file.read().decode('latin1')
             except:
-                content = content_bytes.decode('utf-8', errors='ignore')
+                file.seek(0)
+                content = file.read().decode('utf-8', errors='ignore')
                 
             lines = content.splitlines()
             
-            header_row = -1
-            sep = ',' # Default separator
+            # 2. Achar onde começa a tabela
+            header_idx = find_header_row(file, lines)
             
-            # 2. Procura a linha de cabeçalho
-            for idx, line in enumerate(lines):
-                # Procura por palavras chave DATA e VALOR na mesma linha
-                line_upper = line.upper()
-                if 'DATA' in line_upper and ('VALOR' in line_upper or 'VLR' in line_upper):
-                    header_row = idx
-                    # Detecta separador contando ocorrências na linha de cabeçalho
-                    if line.count(';') > line.count(','):
-                        sep = ';'
-                    else:
-                        sep = ','
-                    break
-            
-            if header_row != -1:
-                # 3. Lê o CSV usando o separador detectado
-                file.seek(0)
-                df = pd.read_csv(file, sep=sep, skiprows=header_row, encoding='latin1', on_bad_lines='skip', engine='python')
+            if header_idx != -1:
+                # Detectar separador
+                sep = detect_separator(lines[header_idx])
                 
-                # Normaliza colunas (UPPERCASE e remove espaços extras)
+                # 3. Ler o CSV a partir da linha correta
+                file.seek(0)
+                df = pd.read_csv(file, sep=sep, skiprows=header_idx, encoding='latin1', on_bad_lines='skip', engine='python')
+                
+                # Limpar nomes das colunas (remover espaços e deixar maiúsculo)
                 df.columns = [str(c).upper().strip() for c in df.columns]
                 
-                # Procura colunas chave
+                # 4. Identificar Colunas Chave
                 col_nome = next((c for c in df.columns if 'NOME' in c or 'DESCRICAO' in c or 'HISTORICO' in c), None)
                 col_valor = next((c for c in df.columns if 'VALOR' in c or 'VLR' in c), None)
                 
                 if col_nome and col_valor:
+                    # Remove linhas de "TOTAL" ou linhas vazias
+                    df = df.dropna(subset=[col_nome])
+                    df = df[~df[col_nome].astype(str).str.upper().str.contains("TOTAL", na=False)]
+                    
                     df['OS_Extraida'] = df[col_nome].astype(str).apply(extract_os_code)
                     df['Valor_Caixa'] = df[col_valor].apply(clean_currency)
                     df['Caixa_Origem'] = file.name
                     df['Nome_Original'] = df[col_nome]
                     
-                    # Mantém apenas linhas onde conseguimos extrair uma OS
+                    # Salva apenas linhas que têm código de OS
                     df_validos = df.dropna(subset=['OS_Extraida']).copy()
                     
                     if not df_validos.empty:
                         dataframes.append(df_validos[['OS_Extraida', 'Valor_Caixa', 'Caixa_Origem', 'Nome_Original']])
-                    # else:
-                    #     errors.append(f"{file.name}: Nenhuma OS encontrada nas linhas.")
                 else:
-                    errors.append(f"{file.name}: Colunas 'NOME' ou 'VALOR' não identificadas.")
+                    errors.append(f"{file.name}: Colunas NOME/VALOR não encontradas na linha {header_idx}.")
             else:
-                errors.append(f"{file.name}: Cabeçalho 'DATA/VALOR' não encontrado.")
+                errors.append(f"{file.name}: Não encontrei cabeçalho (DATA...VALOR).")
                 
         except Exception as e:
             errors.append(f"{file.name}: Erro técnico - {str(e)}")
-            
-        progress_bar.progress((i + 1) / len(uploaded_files))
     
     if errors:
-        with st.expander("⚠️ Avisos de Leitura (Arquivos ignorados ou vazios)"):
-            for err in errors:
-                st.write(err)
+        with st.expander("⚠️ Arquivos ignorados (Ver detalhes)", expanded=False):
+            for e in errors:
+                st.write(e)
             
     if dataframes:
         return pd.concat(dataframes, ignore_index=True)
@@ -184,74 +186,78 @@ def process_caixa_files(uploaded_files):
 
 # --- INTERFACE ---
 
-st.title("📊 Conferência de Caixas vs Bases")
+st.title("📊 Conferência de Caixas Automática")
 
-tab1, tab2, tab3 = st.tabs(["1. Upload das Bases (Convênios)", "2. Upload dos Caixas (Funcionários)", "3. Relatório Final"])
+tab1, tab2, tab3 = st.tabs(["📂 1. Bases (Convênios)", "📂 2. Caixas (Funcionários)", "📝 3. Resultado"])
 
-# --- ABA 1 ---
+# --- ABA 1: BASES ---
 with tab1:
-    st.markdown("### Bases de Laboratório (Medself, Bradesco, etc)")
-    files_base = st.file_uploader("Arraste os CSVs das BASES aqui", accept_multiple_files=True, key="base")
+    st.info("Carregue aqui os relatórios do Medself, Bradesco, Externa, etc.")
+    files_base = st.file_uploader("Arquivos Base", accept_multiple_files=True, key="base", type=['csv','txt'])
     
-    if st.button("Processar Bases", type="primary"):
+    if st.button("Processar Bases"):
         if files_base:
             with st.spinner("Lendo bases..."):
                 df_base = process_base_files(files_base)
                 if df_base is not None:
                     st.session_state['df_base_unificada'] = df_base
-                    st.success(f"✅ Bases processadas! {len(df_base)} registros importados.")
+                    st.success(f"✅ {len(df_base)} exames carregados da Base.")
                 else:
-                    st.error("Nenhum dado válido encontrado nas bases.")
-        else:
-            st.warning("Selecione arquivos primeiro.")
-            
+                    st.error("Nenhum dado encontrado.")
+                    
     if st.session_state['df_base_unificada'] is not None:
-        st.dataframe(st.session_state['df_base_unificada'].head(5), use_container_width=True)
+        st.dataframe(st.session_state['df_base_unificada'].head(), use_container_width=True)
 
-# --- ABA 2 ---
+# --- ABA 2: CAIXAS ---
 with tab2:
-    st.markdown("### Planilhas de Caixa (Isis, Ivone, etc)")
-    files_caixa = st.file_uploader("Arraste os CSVs dos CAIXAS aqui", accept_multiple_files=True, key="caixa")
+    st.info("Carregue aqui os arquivos: Caixa Adrielli, Isis, Ivone, Nathy, Rebeca, etc.")
+    files_caixa = st.file_uploader("Arquivos de Caixa", accept_multiple_files=True, key="caixa", type=['csv','txt'])
     
-    if st.button("Processar Caixas", type="primary"):
+    if st.button("Processar Caixas"):
         if files_caixa:
-            with st.spinner("Lendo caixas e identificando OS..."):
+            with st.spinner("Processando caixas (Isso pode levar alguns segundos)..."):
                 df_caixa = process_caixa_files(files_caixa)
                 if df_caixa is not None:
                     st.session_state['df_caixa_unificado'] = df_caixa
-                    st.success(f"✅ Caixas processados! {len(df_caixa)} lançamentos com OS identificados.")
+                    st.success(f"✅ {len(df_caixa)} lançamentos com OS identificados nos Caixas.")
                 else:
-                    st.error("Não foi possível ler dados válidos dos caixas. Verifique se são CSVs e se têm colunas DATA e VALOR.")
-        else:
-            st.warning("Selecione arquivos primeiro.")
-
+                    st.error("Não consegui ler os caixas. Verifique se são CSVs.")
+    
     if st.session_state['df_caixa_unificado'] is not None:
-        st.dataframe(st.session_state['df_caixa_unificado'].head(5), use_container_width=True)
+        st.dataframe(st.session_state['df_caixa_unificado'].head(), use_container_width=True)
 
-# --- ABA 3 ---
+# --- ABA 3: CONFERÊNCIA ---
 with tab3:
     st.header("Relatório de Divergências")
     
     if st.session_state['df_base_unificada'] is None or st.session_state['df_caixa_unificado'] is None:
-        st.info("👆 Por favor, processe as Bases na Aba 1 e os Caixas na Aba 2 antes de conferir.")
+        st.warning("⚠️ Carregue as BASES e os CAIXAS antes de ver o resultado.")
     else:
         df_b = st.session_state['df_base_unificada']
         df_c = st.session_state['df_caixa_unificado']
         
-        # Agrupamento (caso haja parcelas ou exames quebrados)
-        base_agg = df_b.groupby('OS_Formatada').agg({'Valor_Base': 'sum', 'Arquivo_Origem': 'first'}).reset_index()
-        caixa_agg = df_c.groupby('OS_Extraida').agg({'Valor_Caixa': 'sum', 'Caixa_Origem': 'first', 'Nome_Original': 'first'}).reset_index().rename(columns={'OS_Extraida': 'OS_Formatada'})
+        # Agrupa Bases (Soma valor por OS)
+        base_agg = df_b.groupby('OS_Formatada').agg({
+            'Valor_Base': 'sum', 
+            'Arquivo_Origem': 'first'
+        }).reset_index()
         
-        # Merge (Outer Join)
+        # Agrupa Caixas (Soma valor por OS)
+        caixa_agg = df_c.groupby('OS_Extraida').agg({
+            'Valor_Caixa': 'sum', 
+            'Caixa_Origem': 'first', 
+            'Nome_Original': 'first'
+        }).reset_index().rename(columns={'OS_Extraida': 'OS_Formatada'})
+        
+        # Junta tudo
         merged = pd.merge(base_agg, caixa_agg, on='OS_Formatada', how='outer')
-        merged['Valor_Base'] = merged['Valor_Base'].fillna(0)
-        merged['Valor_Caixa'] = merged['Valor_Caixa'].fillna(0)
+        merged.fillna({'Valor_Base': 0, 'Valor_Caixa': 0}, inplace=True)
         merged['Diferenca'] = merged['Valor_Caixa'] - merged['Valor_Base']
         
-        # Lógica de Status
+        # Define Status
         def get_status(row):
             diff = round(row['Diferenca'], 2)
-            if row['Valor_Base'] == 0: return "SOBRA (Não consta na Base)"
+            if row['Valor_Base'] == 0: return "SOBRA (Extra no Caixa)"
             if row['Valor_Caixa'] == 0: return "FALTA (Não lançado no Caixa)"
             if diff == 0: return "OK"
             if diff > 0: return f"DIVERGÊNCIA: Caixa Maior (+{diff})"
@@ -259,30 +265,34 @@ with tab3:
 
         merged['Status'] = merged.apply(get_status, axis=1)
         
-        # Filtros e Métricas
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Conferido (OK)", len(merged[merged['Status'] == 'OK']))
-        col2.metric("Total Faltas", len(merged[merged['Status'].str.contains("FALTA")]))
-        col3.metric("Total Sobras", len(merged[merged['Status'].str.contains("SOBRA")]))
+        # Layout de Métricas
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("✅ Tudo Certo", len(merged[merged['Status']=='OK']))
+        col2.metric("❌ Faltas (Esqueceram)", len(merged[merged['Status'].str.contains('FALTA')]))
+        col3.metric("⚠️ Sobras (Erro Digitação?)", len(merged[merged['Status'].str.contains('SOBRA')]))
+        col4.metric("📉 Divergência Valor", len(merged[merged['Status'].str.contains('DIVERGÊNCIA')]))
         
-        filtro = st.multiselect("Filtrar Status", options=merged['Status'].unique(), default=[s for s in merged['Status'].unique() if s != 'OK'])
+        st.divider()
         
-        df_show = merged if not filtro else merged[merged['Status'].isin(filtro)]
+        # Filtros
+        opcoes = list(merged['Status'].unique())
+        if 'OK' in opcoes: opcoes.remove('OK') # Remove OK do padrão para focar no erro
         
-        # Tabela Colorida
-        def color_map(val):
+        filtro = st.multiselect("Filtrar Erros:", options=merged['Status'].unique(), default=opcoes)
+        
+        df_final = merged if not filtro else merged[merged['Status'].isin(filtro)]
+        
+        # Cores para a tabela
+        def highlight_vals(val):
             color = ''
-            if "FALTA" in str(val) or "Menor" in str(val): color = '#ffcccc' # Vermelho claro
-            elif "SOBRA" in str(val): color = '#fff3cd' # Amarelo claro
-            elif "OK" in str(val): color = '#ccffcc' # Verde claro
+            if 'FALTA' in str(val) or 'Menor' in str(val): color = '#ffcccc'
+            elif 'SOBRA' in str(val): color = '#fff3cd'
+            elif 'OK' in str(val): color = '#ccffcc'
             return f'background-color: {color}'
 
         st.dataframe(
-            df_show.style.applymap(color_map, subset=['Status'])
-                   .format("{:.2f}", subset=['Valor_Base', 'Valor_Caixa', 'Diferenca']),
-            use_container_width=True
+            df_final.style.applymap(highlight_vals, subset=['Status'])
+                    .format("{:.2f}", subset=['Valor_Base', 'Valor_Caixa', 'Diferenca']),
+            use_container_width=True,
+            height=600
         )
-        
-        # Download
-        csv = merged.to_csv(index=False, sep=';', decimal=',').encode('latin1', errors='replace')
-        st.download_button("📥 Baixar Relatório", data=csv, file_name="relatorio_conferencia.csv", mime="text/csv")
