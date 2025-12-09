@@ -23,45 +23,50 @@ def limpar_valor(valor_str):
     return pd.to_numeric(val, errors='coerce')
 
 def extrair_os_do_nome(texto):
-    """Tenta extrair o código da OS do começo do nome (ex: '001-67494-55 ANA...')"""
+    """
+    Tenta extrair o código da OS do começo do nome.
+    Ex: '001-67494-55 ANA JULIA...' -> Retorna '001-67494-55'
+    Ex: '001-67494-20 - PEDRO...'  -> Retorna '001-67494-20'
+    """
     texto = str(texto).strip()
-    # Pega a primeira 'palavra' que parece um código (números e traços)
+    # Pega a sequência de números e traços no início da string
     match = re.search(r'^([\d-]+)', texto)
     if match:
-        return match.group(1)
-    return texto # Se não achar padrão, devolve o texto original para conferência manual
+        return match.group(1).strip() # Retorna só a OS
+    return texto # Se não achar padrão, devolve o texto original
 
 def processar_extrato(uploaded_file):
     """Lê arquivos da Quinzena (Fonte de Dados/Convênio)"""
     try:
+        # Decodifica para texto
         content = uploaded_file.getvalue().decode("latin1")
         stringio = io.StringIO(content)
         linhas = stringio.readlines()
 
         area_nome = "Desconhecido"
+        # Tenta pegar a área na B9 (linha 8)
         if len(linhas) > 8:
             partes = linhas[8].split(';')
             if len(partes) > 1:
                 area_nome = partes[1].strip()
 
-        # Acha cabeçalho
-        linha_cabecalho = 10
+        # Acha onde começa a tabela (procura "Data;Nome" ou "Cod O.S.")
+        linha_cabecalho = 0
         for i, linha in enumerate(linhas):
-            if linha.startswith("Data;Nome") or "Cod O.S." in linha:
+            if "Data;Nome" in linha or "Cod O.S." in linha:
                 linha_cabecalho = i
                 break
         
+        # Volta ao inicio e lê pulando as linhas desnecessárias
         uploaded_file.seek(0)
         df = pd.read_csv(uploaded_file, sep=';', skiprows=linha_cabecalho, encoding='latin1', dtype=str)
 
-        # Limpeza
         if 'Data' in df.columns:
             df = df.dropna(subset=['Data'])
             df = df[df['Data'] != 'Sub-total']
             df['Area'] = area_nome
             
             # Normalizar Coluna de OS
-            # O arquivo tem 'Cod O.S.', vamos padronizar para 'OS'
             if 'Cod O.S.' in df.columns:
                 df['OS'] = df['Cod O.S.']
             else:
@@ -80,43 +85,70 @@ def processar_extrato(uploaded_file):
 def processar_caixa(uploaded_file):
     """Lê arquivos do Caixa (Isis, Ivone, etc)"""
     try:
-        # Detectar separador (alguns csvs usam , outros ;)
-        content = uploaded_file.getvalue().decode("utf-8", errors='replace') # Tenta utf-8, fallback replace
-        sep = ',' if ',' in content.split('\n')[0] else ';'
+        # 1. Decodificação Robusta (Lê o arquivo como texto primeiro)
+        bytes_data = uploaded_file.getvalue()
+        try:
+            content = bytes_data.decode("utf-8", errors='replace')
+        except:
+            content = bytes_data.decode("latin1", errors='replace')
+            
+        stringio = io.StringIO(content)
+        linhas = stringio.readlines()
         
-        uploaded_file.seek(0)
-        df = pd.read_csv(uploaded_file, sep=sep, encoding='utf-8', errors='replace', dtype=str)
+        # 2. Encontrar onde começa o cabeçalho (DATA, NOME, VALOR...)
+        # Isso evita ler "VALOR DE INICIO" como se fosse coluna
+        linha_cabecalho = 0
+        sep_detectado = ',' 
         
-        # Identificar coluna de Nome/OS
-        # Variações: "NOME", "OS - NOME", "OS-NOME"
+        for i, linha in enumerate(linhas):
+            linha_upper = linha.upper()
+            if "DATA" in linha_upper and "VALOR" in linha_upper:
+                linha_cabecalho = i
+                # Verifica separador nessa linha
+                if ';' in linha: sep_detectado = ';'
+                break
+        
+        # 3. Ler o CSV a partir da linha correta
+        stringio.seek(0) # Volta pro inicio do texto
+        df = pd.read_csv(
+            stringio, 
+            sep=sep_detectado, 
+            skiprows=linha_cabecalho, 
+            dtype=str
+        )
+        
+        # 4. Normalizar nomes das colunas (remover espaços extras e maiusculas)
+        df.columns = [c.strip().upper() for c in df.columns]
+
+        # 5. Identificar coluna de Nome e Valor dinamicamente
         col_nome = None
         for col in df.columns:
-            if 'NOME' in col.upper():
+            if 'NOME' in col: # Pega "NOME", "OS - NOME", "OS-NOME"
                 col_nome = col
                 break
         
-        # Identificar coluna Valor
         col_valor = None
         for col in df.columns:
-            if 'VALOR' in col.upper():
+            if 'VALOR' in col:
                 col_valor = col
                 break
 
         if col_nome and col_valor:
+            # Separa a OS do Nome (Ex: "001-67494-55 ANA..." -> "001-67494-55")
             df['OS_Caixa'] = df[col_nome].apply(extrair_os_do_nome)
             df['Valor_Caixa'] = df[col_valor].apply(limpar_valor)
             df['Arquivo_Caixa'] = uploaded_file.name
             
-            # Remove linhas sem valor (ex: cabeçalhos intermediários)
+            # Remove linhas vazias (onde não tem valor)
             df = df.dropna(subset=['Valor_Caixa'])
             
             return df[['OS_Caixa', col_nome, 'Valor_Caixa', 'Arquivo_Caixa']]
         else:
-            st.warning(f"Colunas não identificadas no arquivo {uploaded_file.name}")
+            st.warning(f"Não achei colunas NOME/VALOR no arquivo {uploaded_file.name}. Colunas achadas: {df.columns.tolist()}")
             return pd.DataFrame()
 
     except Exception as e:
-        st.error(f"Erro no caixa {uploaded_file.name}: {e}")
+        st.error(f"Erro técnico no arquivo {uploaded_file.name}: {e}")
         return pd.DataFrame()
 
 # --- Interface Principal ---
@@ -139,7 +171,7 @@ if files_extratos:
         # Limpar espaços em branco na OS para garantir o match
         df_base['OS'] = df_base['OS'].str.strip()
         
-        st.info(f"Base carregada: {len(df_base)} registros encontrados em {len(files_extratos)} arquivos.")
+        st.success(f"Base carregada: {len(df_base)} registros de {len(files_extratos)} áreas.")
         with st.expander("Ver Base de Dados Completa"):
             st.dataframe(df_base)
 
@@ -150,7 +182,9 @@ files_caixa = st.file_uploader("Upload dos CSVs de Caixa", accept_multiple_files
 if files_caixa and not df_base.empty:
     lista_cx = []
     for f in files_caixa:
-        lista_cx.append(processar_caixa(f))
+        df_proc = processar_caixa(f)
+        if not df_proc.empty:
+            lista_cx.append(df_proc)
     
     if lista_cx:
         df_caixa = pd.concat(lista_cx, ignore_index=True)
@@ -167,16 +201,15 @@ if files_caixa and not df_base.empty:
             left_on='OS_Caixa', 
             right_on='OS', 
             how='left', 
-            indicator=True # Cria coluna '_merge' para saber se achou ou não
+            indicator=True 
         )
 
-        # Análises
+        # Filtros de Análise
         
         # 1. Duplicados no Caixa (Mesma OS cobrada 2x?)
-        duplicados = df_final[df_final.duplicated(subset=['OS_Caixa'], keep=False)].sort_values('OS_Caixa')
+        duplicados = df_final[df_final.duplicated(subset=['OS_Caixa', 'Arquivo_Caixa'], keep=False)].sort_values('OS_Caixa')
         
-        # 2. Encontrados e Valores Batem
-        # Tolerância pequena para erros de arredondamento (0.01 centavo)
+        # 2. Encontrados e Valores Batem (com tolerância de 2 centavos)
         match_ok = df_final[
             (df_final['_merge'] == 'both') & 
             (abs(df_final['Valor_Caixa'] - df_final['Valor_Extrato']) < 0.02)
@@ -188,36 +221,34 @@ if files_caixa and not df_base.empty:
             (abs(df_final['Valor_Caixa'] - df_final['Valor_Extrato']) >= 0.02)
         ]
         
-        # 4. Não encontrados na Base (OS existe no caixa, mas não nos extratos)
+        # 4. Não encontrados na Base
         nao_encontrados = df_final[df_final['_merge'] == 'left_only']
 
-        # --- Exibição dos Resultados ---
+        # --- Exibição ---
         
-        tab1, tab2, tab3, tab4 = st.tabs(["✅ Bateu (OK)", "⚠️ Valores Diferentes", "❌ Não encontrado na Base", "👀 Duplicados"])
+        tab1, tab2, tab3, tab4 = st.tabs(["✅ Bateu (OK)", "⚠️ Divergência de Valor", "❌ Não Achado na Base", "👀 Duplicados"])
         
         with tab1:
-            st.metric("Quantidade OK", len(match_ok))
+            st.metric("Total OK", len(match_ok))
             st.dataframe(match_ok[['OS_Caixa', 'Nome', 'Area', 'Valor_Caixa']])
             
         with tab2:
-            st.error(f"Atenção: {len(divergentes)} registros com diferença de valor!")
+            st.error(f"{len(divergentes)} registros com valor diferente!")
             if not divergentes.empty:
-                # Mostrar comparativo
-                view_div = divergentes[['OS_Caixa', 'Nome', 'Area', 'Valor_Caixa', 'Valor_Extrato']]
+                view_div = divergentes[['OS_Caixa', 'Nome', 'Area', 'Valor_Caixa', 'Valor_Extrato', 'Arquivo_Caixa']].copy()
                 view_div['Diferença'] = view_div['Valor_Caixa'] - view_div['Valor_Extrato']
                 st.dataframe(view_div.style.format({'Valor_Caixa': '{:.2f}', 'Valor_Extrato': '{:.2f}', 'Diferença': '{:.2f}'}))
         
         with tab3:
-            st.warning(f"{len(nao_encontrados)} registros não achados nos extratos importados.")
-            st.write("Verifique se o paciente é particular ou de convênio não importado.")
+            st.warning(f"{len(nao_encontrados)} registros no caixa sem correspondência nos extratos.")
             st.dataframe(nao_encontrados[['OS_Caixa', 'Arquivo_Caixa', 'Valor_Caixa']])
             
         with tab4:
             if not duplicados.empty:
-                st.write("Estas OS aparecem mais de uma vez no caixa:")
-                st.dataframe(duplicados)
+                st.write("Atenção: Mesma OS lançada mais de uma vez:")
+                st.dataframe(duplicados[['OS_Caixa', 'Arquivo_Caixa', 'Valor_Caixa']])
             else:
-                st.success("Nenhuma duplicidade encontrada no caixa.")
+                st.success("Sem duplicidades.")
 
 elif files_caixa and df_base.empty:
-    st.warning("Por favor, faça o upload dos Extratos (Passo 1) antes de conferir o caixa.")
+    st.warning("⚠️ Carregue os Extratos (Passo 1) primeiro!")
