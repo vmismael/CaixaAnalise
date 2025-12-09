@@ -1,105 +1,106 @@
 import streamlit as st
 import pandas as pd
-import io
+from io import StringIO
 
-def limpar_e_ler_extrato(uploaded_file):
-    """
-    Função para processar um único arquivo CSV de extrato.
-    Lê a credencial na B9, limpa linhas de subtotal e formata valores.
-    """
-    try:
-        # Lê o conteúdo do arquivo como texto para extrair metadados
-        # Usamos latin1 pois sistemas brasileiros antigos costumam usar essa codificação
-        stringio = io.StringIO(uploaded_file.getvalue().decode("latin1"))
-        linhas = stringio.readlines()
+def clean_currency(x):
+    """Converte strings de moeda (ex: '1.234,56') para float."""
+    if isinstance(x, str):
+        return float(x.replace('.', '').replace(',', '.'))
+    return float(x)
 
-        # 1. Extrair a Área (Credenciado)
-        # O usuário informou que fica na B9. No Python (index 0), isso é linha 8, coluna 1.
-        area_nome = "Desconhecido"
-        if len(linhas) > 8:
-            partes = linhas[8].split(';')
-            if len(partes) > 1:
-                area_nome = partes[1].strip()
+st.set_page_config(page_title="Conferência de Caixa", layout="wide")
+st.title("Conferência de Caixa - Consolidação de Extratos")
 
-        # 2. Encontrar onde começam os dados
-        # Procuramos a linha que começa com "Data;Nome"
-        linha_cabecalho = 10 # Padrão observado
-        for i, linha in enumerate(linhas):
-            if linha.startswith("Data;Nome"):
-                linha_cabecalho = i
-                break
-        
-        # Volta o ponteiro do arquivo para o início para o pandas ler
-        uploaded_file.seek(0)
-        
-        # 3. Ler o CSV com o Pandas
-        df = pd.read_csv(
-            uploaded_file, 
-            sep=';', 
-            skiprows=linha_cabecalho, 
-            encoding='latin1',
-            # Força ler como string primeiro para evitar erros de conversão
-            dtype={'Valor': str, 'CH': str} 
-        )
-
-        # 4. Limpeza de Dados
-        if 'Data' in df.columns:
-            # Remove linhas vazias ou linhas de 'Sub-total'
-            df = df.dropna(subset=['Data'])
-            df = df[df['Data'] != 'Sub-total']
-
-            # Cria a coluna da Área
-            df['Area'] = area_nome
-
-            # Tratamento de Valores (R$ 1.250,00 -> 1250.00)
-            if 'Valor' in df.columns:
-                df['Valor'] = df['Valor'].str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
-                df['Valor'] = pd.to_numeric(df['Valor'], errors='coerce')
-
-            # Tratamento de Data
-            df['Data'] = pd.to_datetime(df['Data'], format='%d/%m/%Y', errors='coerce')
-
-            return df
-        else:
-            # Caso o arquivo não tenha a coluna Data (arquivo vazio ou formato errado)
-            return pd.DataFrame()
-
-    except Exception as e:
-        st.error(f"Erro ao processar arquivo {uploaded_file.name}: {e}")
-        return pd.DataFrame()
-
-# --- Interface do Streamlit ---
-st.title("Conferência de Caixa 💰")
-st.subheader("Etapa 1: Importação dos Extratos")
-
-arquivos_extratos = st.file_uploader(
-    "Faça upload dos arquivos CSV das áreas (quinzena)", 
+uploaded_files = st.file_uploader(
+    "Faça o upload dos arquivos CSV (Extratos)", 
     accept_multiple_files=True, 
-    type=['csv']
+    type="csv"
 )
 
-if arquivos_extratos:
-    lista_dfs = []
+if uploaded_files:
+    all_data = []
     
-    for arquivo in arquivos_extratos:
-        df_temp = limpar_e_ler_extrato(arquivo)
+    for uploaded_file in uploaded_files:
+        try:
+            # Ler o conteúdo do arquivo com encoding 'latin1' (comum nesses relatórios)
+            stringio = StringIO(uploaded_file.getvalue().decode("latin1"))
+            lines = stringio.readlines()
+            
+            # Pula arquivos que não têm cabeçalho suficiente (linhas insuficientes)
+            if len(lines) < 11:
+                continue
+
+            # 1. Extrair Credencial (Célula B9 -> Linha índice 8, Coluna índice 1)
+            try:
+                line_b9 = lines[8].strip().split(';')
+                # Verifica se existe a coluna B
+                if len(line_b9) > 1:
+                    credencial = line_b9[1]
+                else:
+                    credencial = "Desconhecido"
+            except Exception:
+                credencial = "Erro Leitura"
+
+            # 2. Ler os dados (Cabeçalho está na linha 11 -> índice 10)
+            # Juntamos as linhas a partir do cabeçalho para o pandas ler
+            data_content = "".join(lines[10:])
+            df = pd.read_csv(StringIO(data_content), sep=';')
+            
+            # Se o dataframe estiver vazio, pula
+            if df.empty:
+                continue
+
+            # 3. Limpeza de Dados
+            # Remover linhas de 'Sub-total'
+            if 'Data' in df.columns:
+                df = df[df['Data'] != 'Sub-total']
+            
+            # Remover linhas onde 'Cod O.S.' é nulo (linhas vazias)
+            if 'Cod O.S.' in df.columns:
+                df = df.dropna(subset=['Cod O.S.'])
+
+            # Adicionar a coluna da Credencial/Área
+            df['Credencial'] = credencial
+            
+            # Converter Valor para número
+            if 'Valor' in df.columns:
+                df['Valor'] = df['Valor'].apply(clean_currency)
+            
+            all_data.append(df)
+            
+        except Exception as e:
+            st.error(f"Erro ao processar arquivo {uploaded_file.name}: {e}")
+
+    if all_data:
+        # Juntar todos os dataframes
+        df_final = pd.concat(all_data, ignore_index=True)
+
+        # 4. Agrupar por Credencial e OS (Somar Valor)
+        # Mantemos o 'Nome' pegando o primeiro encontrado para aquela OS, para referência
+        df_grouped = df_final.groupby(['Credencial', 'Cod O.S.', 'Nome'])['Valor'].sum().reset_index()
+
+        st.success(f"{len(uploaded_files)} arquivos processados com sucesso!")
         
-        if not df_temp.empty:
-            lista_dfs.append(df_temp)
-    
-    if lista_dfs:
-        # Junta todos os arquivos em um só
-        df_extratos_consolidado = pd.concat(lista_dfs, ignore_index=True)
+        # Exibir Totais por Área
+        st.subheader("Resumo por Área (Credencial)")
+        resumo_area = df_grouped.groupby('Credencial')['Valor'].sum().reset_index()
+        st.dataframe(resumo_area.style.format({"Valor": "R$ {:,.2f}"}))
+
+        # Exibir Tabela Detalhada
+        st.subheader("Detalhamento por OS")
+        st.dataframe(df_grouped.style.format({"Valor": "R$ {:,.2f}"}))
         
-        st.success(f"{len(lista_dfs)} arquivos processados com sucesso!")
+        # Botão para baixar o CSV consolidado
+        csv = df_grouped.to_csv(index=False, sep=';', decimal=',').encode('latin1')
+        st.download_button(
+            label="Baixar Planilha Consolidada",
+            data=csv,
+            file_name="extratos_consolidados.csv",
+            mime="text/csv",
+        )
         
-        # Mostra uma prévia dos dados
-        st.dataframe(df_extratos_consolidado.head())
-        
-        # Mostra totais por área para conferência rápida
-        st.write("Resumo por Área:")
-        resumo = df_extratos_consolidado.groupby('Area')['Valor'].sum().reset_index()
-        st.dataframe(resumo)
+        # Guardar no session state para a próxima etapa (comparação)
+        st.session_state['df_extratos'] = df_grouped
         
     else:
-        st.warning("Nenhum dado válido encontrado nos arquivos enviados.")
+        st.warning("Nenhum dado válido foi encontrado nos arquivos enviados.")
