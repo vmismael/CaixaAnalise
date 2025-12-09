@@ -3,233 +3,301 @@ import pandas as pd
 import re
 from io import StringIO
 
-# --- Configuração da Página ---
-st.set_page_config(page_title="Conferência de Caixa", layout="wide")
-st.title("Conferência de Caixa 💰")
-st.markdown("---")
+st.set_page_config(page_title="Conferência Total: Extratos vs Caixa", layout="wide")
+st.title("Conferência de Caixa Completa 📊")
 
-# --- FUNÇÕES DE LIMPEZA E EXTRAÇÃO ---
+# --- FUNÇÕES AUXILIARES ---
 
-def limpar_valor_extrato(x):
+def clean_currency(x):
     """
-    Limpa valor do Extrato Consolidado (formato brasileiro: 1.000,00).
-    Ex: '229,06' vira 229.06
+    Tenta converter qualquer formato de moeda (1.000,00 ou 1000.00 ou R$ 1000) para float.
     """
-    if isinstance(x, (int, float)): return float(x)
-    if isinstance(x, str):
-        # Remove pontos de milhar e troca vírgula decimal por ponto
-        clean = x.replace('.', '').replace(',', '.')
-        try:
-            return float(clean)
-        except:
-            return 0.0
-    return 0.0
-
-def limpar_valor_caixa(x):
-    """
-    Limpa valor dos Caixas (formato misto, geralmente ponto flutuante ou texto).
-    Remove 'R$', espaços e converte para float.
-    """
-    if isinstance(x, (int, float)): return float(x)
+    if isinstance(x, (int, float)):
+        return float(x)
+    
     if isinstance(x, str):
         clean = x.replace('R$', '').strip()
-        # Se tiver vírgula e ponto, assume que ponto é milhar e vírgula é decimal
-        if ',' in clean and '.' in clean:
-            clean = clean.replace('.', '').replace(',', '.')
-        # Se tiver só vírgula, troca por ponto
-        elif ',' in clean:
-            clean = clean.replace(',', '.')
+        # Se for vazio ou apenas caracteres estranhos
+        if not any(char.isdigit() for char in clean):
+            return 0.0
         
         try:
+            # Lógica para detectar se o separador decimal é vírgula ou ponto
+            if ',' in clean and '.' in clean:
+                # Formato brasileiro com milhar (1.234,56) -> remove ponto, troca vírgula
+                clean = clean.replace('.', '').replace(',', '.')
+            elif ',' in clean:
+                # Apenas vírgula (1234,56) -> troca por ponto
+                clean = clean.replace(',', '.')
+            # Se tiver só ponto (1234.56), o float() do python já entende
+            
             return float(clean)
         except:
             return 0.0
     return 0.0
 
-def extrair_os(texto):
-    """
-    Procura o padrão de OS (ex: 001-67495-31) dentro de um texto.
-    """
+def extract_os(texto):
+    """Extrai o padrão de OS (ex: 001-67495-31) de dentro de um texto."""
     if not isinstance(texto, str):
         return None
-    # Regex para capturar: 3 dígitos - 4 a 6 dígitos - 1 a 3 dígitos
+    # Regex: 3 digitos - 4 a 6 digitos - 1 a 3 digitos
     match = re.search(r'(\d{3}-\d{4,6}-\d{1,3})', texto)
     if match:
         return match.group(1)
     return None
 
-# --- INTERFACE E PROCESSAMENTO ---
+# ==============================================================================
+# ETAPA 1: PROCESSAMENTO DOS EXTRATOS (CONVÊNIOS)
+# ==============================================================================
+st.header("1. Extratos (Convênios/Áreas)")
+st.info("Faça o upload dos arquivos CSV que têm a credencial na célula B9.")
 
-col_upload1, col_upload2 = st.columns(2)
+uploaded_extratos = st.file_uploader(
+    "Upload dos Extratos (.csv)", 
+    accept_multiple_files=True, 
+    type=["csv"],
+    key="extratos_uploader"
+)
 
-with col_upload1:
-    st.header("1. Extrato Consolidado")
-    file_extrato = st.file_uploader("Upload 'extratos_consolidados.csv'", type=["csv"], key="extrato")
+df_extratos_final = None
 
-with col_upload2:
-    st.header("2. Arquivos de Caixa")
-    files_caixa = st.file_uploader("Upload dos arquivos de Caixa", accept_multiple_files=True, type=["csv"], key="caixa")
-
-if file_extrato and files_caixa:
-    st.markdown("---")
-    st.info("Processando arquivos...")
-
-    # ---------------------------------------------------------
-    # 1. PROCESSAR EXTRATO
-    # ---------------------------------------------------------
-    try:
-        # Lê o consolidado. Assume separador ';' e decimal ',' (padrão do arquivo que você enviou)
-        df_ext = pd.read_csv(file_extrato, sep=';')
-        
-        # Garante que as colunas certas existem
-        if 'Cod O.S.' in df_ext.columns and 'Valor' in df_ext.columns:
-            # Renomeia para padronizar
-            df_ext = df_ext.rename(columns={'Cod O.S.': 'OS', 'Valor': 'Valor_Extrato'})
-            
-            # Limpa valores
-            df_ext['Valor_Extrato'] = df_ext['Valor_Extrato'].apply(limpar_valor_extrato)
-            
-            # Agrupa por OS (soma valores se houver mesma OS repetida)
-            df_ext_agrupado = df_ext.groupby('OS')['Valor_Extrato'].sum().reset_index()
-            
-        else:
-            st.error("O arquivo de extrato não tem as colunas 'Cod O.S.' e 'Valor'. Verifique o arquivo.")
-            st.stop()
-            
-    except Exception as e:
-        st.error(f"Erro ao ler extrato: {e}")
-        st.stop()
-
-    # ---------------------------------------------------------
-    # 2. PROCESSAR CAIXAS
-    # ---------------------------------------------------------
-    dados_caixa = []
+if uploaded_extratos:
+    lista_extratos = []
     
-    for file in files_caixa:
+    progress_bar = st.progress(0)
+    
+    for i, file in enumerate(uploaded_extratos):
         try:
-            # Lê o conteúdo do arquivo
-            # Tenta decodificar utf-8, se falhar tenta latin1
+            # Ler linhas para pré-processamento
+            content = file.getvalue().decode("latin1")
+            lines = content.splitlines()
+            
+            if len(lines) < 11: continue # Arquivo muito pequeno/vazio
+            
+            # 1. Pega Credencial (B9 -> linha index 8)
+            credencial = "Desconhecido"
             try:
-                conteudo = file.getvalue().decode('utf-8')
+                line_b9 = lines[8].strip().split(';')
+                if len(line_b9) > 1:
+                    credencial = line_b9[1]
             except:
-                conteudo = file.getvalue().decode('latin1')
+                pass
             
-            linhas = conteudo.splitlines()
+            # 2. Lê os dados (Cabeçalho na linha 11 -> index 10)
+            data_io = StringIO("\n".join(lines[10:]))
+            df = pd.read_csv(data_io, sep=';')
             
-            # Procura a linha de cabeçalho dinamicamente
-            indice_cabecalho = -1
-            for i, linha in enumerate(linhas):
-                linha_upper = linha.upper()
-                # O cabeçalho deve ter 'VALOR' e ('NOME' ou 'OS')
-                if 'VALOR' in linha_upper and ('NOME' in linha_upper or 'OS' in linha_upper):
-                    indice_cabecalho = i
-                    break
+            # 3. Limpeza
+            # Remover linhas de sub-total
+            if 'Data' in df.columns:
+                df = df[df['Data'] != 'Sub-total']
             
-            if indice_cabecalho == -1:
-                st.warning(f"Arquivo '{file.name}' pulado: Cabeçalho não encontrado.")
-                continue
+            # Remover vazios de OS
+            if 'Cod O.S.' in df.columns:
+                df = df.dropna(subset=['Cod O.S.'])
                 
-            # Determina o separador (vírgula ou ponto e vírgula)
-            sep = ';' if ';' in linhas[indice_cabecalho] else ','
-            
-            # Cria DataFrame a partir do cabeçalho encontrado
-            df_temp = pd.read_csv(StringIO("\n".join(linhas[indice_cabecalho:])), sep=sep)
-            
-            # Identifica colunas de interesse
-            col_nome = None
-            col_valor = None
-            
-            for col in df_temp.columns:
-                if 'NOME' in col.upper() or 'OS' in col.upper():
-                    col_nome = col
-                if 'VALOR' in col.upper():
-                    col_valor = col
-            
-            if col_nome and col_valor:
-                # Extrai OS e Limpa Valor
-                df_temp['OS'] = df_temp[col_nome].apply(extrair_os)
-                df_temp['Valor_Caixa'] = df_temp[col_valor].apply(limpar_valor_caixa)
+                # Normaliza colunas
+                df['Credencial'] = credencial
+                df['Arquivo_Origem'] = file.name
                 
-                # Remove linhas sem OS válida
-                df_temp = df_temp.dropna(subset=['OS'])
+                # Limpa Valor
+                if 'Valor' in df.columns:
+                    df['Valor'] = df['Valor'].apply(clean_currency)
                 
-                # Guarda os dados
-                dados_caixa.append(df_temp[['OS', 'Valor_Caixa']])
+                lista_extratos.append(df)
                 
         except Exception as e:
-            st.error(f"Erro ao processar caixa '{file.name}': {e}")
-
-    if not dados_caixa:
-        st.error("Nenhum dado válido encontrado nos arquivos de caixa.")
-        st.stop()
-
-    # Junta todos os caixas e soma por OS
-    df_caixa_total = pd.concat(dados_caixa, ignore_index=True)
-    df_caixa_agrupado = df_caixa_total.groupby('OS')['Valor_Caixa'].sum().reset_index()
-
-    # ---------------------------------------------------------
-    # 3. COMPARAÇÃO (CRUZAMENTO)
-    # ---------------------------------------------------------
+            st.error(f"Erro ao ler {file.name}: {e}")
+        
+        progress_bar.progress((i + 1) / len(uploaded_extratos))
     
-    # Junta Extrato e Caixa usando a coluna OS
-    # how='outer' garante que mostramos OS que estão em um mas não no outro
-    df_final = pd.merge(df_ext_agrupado, df_caixa_agrupado, on='OS', how='outer').fillna(0)
+    if lista_extratos:
+        df_extratos_final = pd.concat(lista_extratos, ignore_index=True)
+        
+        # Agrupar por OS para comparação futura (somar valores da mesma OS)
+        df_ext_grouped = df_extratos_final.groupby(['Cod O.S.', 'Credencial'])['Valor'].sum().reset_index()
+        df_ext_grouped.rename(columns={'Cod O.S.': 'OS', 'Valor': 'Valor_Extrato'}, inplace=True)
+        
+        # MOSTRAR RESUMO
+        c1, c2 = st.columns(2)
+        c1.success(f"{len(uploaded_extratos)} arquivos processados.")
+        c1.write(f"**Total Extratos:** R$ {df_ext_grouped['Valor_Extrato'].sum():,.2f}")
+        
+        with c2:
+            st.write("Resumo por Área:")
+            resumo = df_ext_grouped.groupby('Credencial')['Valor_Extrato'].sum().reset_index()
+            st.dataframe(resumo.style.format({"Valor_Extrato": "R$ {:,.2f}"}), height=150)
+
+        with st.expander("Ver Tabela Completa dos Extratos"):
+            st.dataframe(df_ext_grouped)
+
+st.markdown("---")
+
+# ==============================================================================
+# ETAPA 2: PROCESSAMENTO DOS CAIXAS (EXCEL OU CSV)
+# ==============================================================================
+st.header("2. Caixas (Financeiro)")
+st.info("Faça o upload das planilhas de caixa (Excel .xlsx ou CSV).")
+
+# AQUI: Adicionado suporte a xlsx e xls
+uploaded_caixas = st.file_uploader(
+    "Upload dos Caixas (.csv, .xlsx)", 
+    accept_multiple_files=True, 
+    type=["csv", "xlsx", "xls"],
+    key="caixas_uploader"
+)
+
+df_caixa_final = None
+
+if uploaded_caixas:
+    lista_caixas = []
     
-    # Calcula diferença
-    df_final['Diferenca'] = df_final['Valor_Extrato'] - df_final['Valor_Caixa']
+    for file in uploaded_caixas:
+        try:
+            df_temp = None
+            
+            # A. LER ARQUIVO (Excel ou CSV)
+            if file.name.endswith('.xlsx') or file.name.endswith('.xls'):
+                # Ler Excel
+                df_raw = pd.read_excel(file)
+                # O Pandas lê o Excel inteiro. Precisamos achar a linha de cabeçalho.
+                # Vamos converter para lista de listas para achar o cabeçalho
+                valores = df_raw.values.tolist()
+                cols = df_raw.columns.tolist()
+                todos_dados = [cols] + valores
+                
+                header_idx = -1
+                for i, row in enumerate(todos_dados):
+                    row_str = str(row).upper()
+                    if 'VALOR' in row_str and ('NOME' in row_str or 'OS' in row_str):
+                        header_idx = i
+                        break
+                
+                if header_idx != -1:
+                    # Recria o DataFrame usando a linha certa como cabeçalho
+                    # Se header_idx for 0, o df_raw já estava certo, mas vamos garantir
+                    keys = todos_dados[header_idx]
+                    data = todos_dados[header_idx+1:]
+                    df_temp = pd.DataFrame(data, columns=keys)
+
+            else:
+                # Ler CSV
+                try:
+                    content = file.getvalue().decode("utf-8")
+                except:
+                    content = file.getvalue().decode("latin1")
+                
+                lines = content.splitlines()
+                header_idx = -1
+                for i, line in enumerate(lines):
+                    l_upper = line.upper()
+                    if 'VALOR' in l_upper and ('NOME' in l_upper or 'OS' in l_upper):
+                        header_idx = i
+                        break
+                
+                if header_idx != -1:
+                    sep = ';' if ';' in lines[header_idx] else ','
+                    df_temp = pd.read_csv(StringIO("\n".join(lines[header_idx:])), sep=sep)
+
+            # B. EXTRAIR DADOS SE O DATAFRAME FOI CRIADO
+            if df_temp is not None:
+                # Normalizar nomes de colunas para maiúsculo
+                df_temp.columns = [str(c).upper().strip() for c in df_temp.columns]
+                
+                # Achar coluna de Nome/OS e Valor
+                col_nome = next((c for c in df_temp.columns if 'NOME' in c or 'OS' in c), None)
+                col_valor = next((c for c in df_temp.columns if 'VALOR' in c), None)
+                
+                if col_nome and col_valor:
+                    # Copia apenas o necessário
+                    df_clean = pd.DataFrame()
+                    df_clean['OS'] = df_temp[col_nome].apply(extract_os)
+                    df_clean['Valor_Caixa'] = df_temp[col_valor].apply(clean_currency)
+                    df_clean['Arquivo_Caixa'] = file.name
+                    
+                    # Remove quem não tem OS
+                    df_clean = df_clean.dropna(subset=['OS'])
+                    lista_caixas.append(df_clean)
+                else:
+                    st.warning(f"Não achei colunas NOME/OS e VALOR em {file.name}")
+            else:
+                st.warning(f"Não achei cabeçalho válido em {file.name}")
+
+        except Exception as e:
+            st.error(f"Erro processando {file.name}: {e}")
+
+    if lista_caixas:
+        df_caixas_all = pd.concat(lista_caixas, ignore_index=True)
+        # Agrupa por OS (pode ter pagamentos parciais)
+        df_caixa_final = df_caixas_all.groupby('OS')['Valor_Caixa'].sum().reset_index()
+        
+        st.success(f"Caixas processados! Total Identificado: R$ {df_caixa_final['Valor_Caixa'].sum():,.2f}")
+        with st.expander("Ver dados do Caixa"):
+            st.dataframe(df_caixa_final)
+
+# ==============================================================================
+# ETAPA 3: COMPARAÇÃO E RESULTADOS
+# ==============================================================================
+
+if df_extratos_final is not None and df_caixa_final is not None:
+    st.markdown("---")
+    st.header("3. Resultado da Conferência")
     
-    # Define Status
-    def definir_status(row):
-        # Margem pequena para erro de arredondamento (0.01 centavo)
-        if abs(row['Diferenca']) < 0.02:
+    # Merge
+    df_merged = pd.merge(df_ext_grouped, df_caixa_final, on='OS', how='outer').fillna(0)
+    
+    # Calcular Diferença
+    df_merged['Diferenca'] = df_merged['Valor_Extrato'] - df_merged['Valor_Caixa']
+    
+    # Definir Status
+    def get_status(row):
+        if abs(row['Diferenca']) < 0.05: # Aceita 5 centavos de erro
             return "OK"
-        elif row['Valor_Extrato'] > 0 and row['Valor_Caixa'] == 0:
+        if row['Valor_Extrato'] > 0 and row['Valor_Caixa'] == 0:
             return "Falta no Caixa"
-        elif row['Valor_Extrato'] == 0 and row['Valor_Caixa'] > 0:
-            return "Sobra no Caixa (Não está no Extrato)"
-        else:
-            return "Valor Divergente"
+        if row['Valor_Extrato'] == 0 and row['Valor_Caixa'] > 0:
+            return "Sobra no Caixa (Não estava no Extrato)"
+        return "Valor Divergente"
 
-    df_final['Status'] = df_final.apply(definir_status, axis=1)
-
-    # ---------------------------------------------------------
-    # 4. EXIBIÇÃO DOS RESULTADOS
-    # ---------------------------------------------------------
+    df_merged['Status'] = df_merged.apply(get_status, axis=1)
     
-    st.subheader("Resultados da Conferência")
+    # Filtros
+    filtro_status = st.radio("Filtrar por Status:", ["Divergências", "Tudo", "OK"], horizontal=True)
     
-    # Métricas
-    total_ext = df_final['Valor_Extrato'].sum()
-    total_cx = df_final['Valor_Caixa'].sum()
-    total_diff = total_ext - total_cx
-    
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Total Extratos", f"R$ {total_ext:,.2f}")
-    m2.metric("Total Caixas", f"R$ {total_cx:,.2f}")
-    m3.metric("Diferença Global", f"R$ {total_diff:,.2f}", delta_color="inverse")
-
-    # Filtros de Visualização
-    filtro = st.radio("Filtrar visualização:", ["Divergências", "Tudo", "Apenas OK"], horizontal=True)
-    
-    if filtro == "Divergências":
-        df_show = df_final[df_final['Status'] != "OK"]
-    elif filtro == "Apenas OK":
-        df_show = df_final[df_final['Status'] == "OK"]
+    if filtro_status == "Divergências":
+        df_show = df_merged[df_merged['Status'] != "OK"]
+    elif filtro_status == "OK":
+        df_show = df_merged[df_merged['Status'] == "OK"]
     else:
-        df_show = df_final
-
-    # Formatação de cores
-    def colorir_tabela(val):
+        df_show = df_merged
+        
+    # Estilização das Cores
+    def colorir(val):
         color = ''
-        if val == 'OK': color = '#d4edda' # Verde claro
-        elif val == 'Valor Divergente': color = '#f8d7da' # Vermelho claro
-        elif val == 'Falta no Caixa': color = '#fff3cd' # Amarelo claro
-        elif val == 'Sobra no Caixa (Não está no Extrato)': color = '#cce5ff' # Azul claro
+        if val == 'OK': color = '#d1e7dd' # Verde
+        elif val == 'Falta no Caixa': color = '#f8d7da' # Vermelho
+        elif val == 'Sobra no Caixa (Não estava no Extrato)': color = '#fff3cd' # Amarelo
+        elif val == 'Valor Divergente': color = '#cff4fc' # Azul
         return f'background-color: {color}'
 
-    # Exibe Tabela
+    # Exibir Tabela Final
     st.dataframe(
-        df_show.style.applymap(colorir_tabela, subset=['Status'])
+        df_show.style.applymap(colorir, subset=['Status'])
                .format({"Valor_Extrato": "R$ {:,.2f}", "Valor_Caixa": "R$ {:,.2f}", "Diferenca": "R$ {:,.2f}"}),
-        use_container_width=True
+        use_container_width=True,
+        height=600
     )
+    
+    # Botão de Download
+    csv_final = df_merged.to_csv(index=False, sep=';', decimal=',').encode('latin1')
+    st.download_button(
+        "Baixar Relatório Final de Divergências",
+        data=csv_final,
+        file_name="relatorio_conferencia.csv",
+        mime="text/csv"
+    )
+
+elif df_extratos_final is None:
+    st.warning("Aguardando upload dos Extratos (Passo 1)...")
+elif df_caixa_final is None:
+    st.warning("Aguardando upload dos Caixas (Passo 2)...")
