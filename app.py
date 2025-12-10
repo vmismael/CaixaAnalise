@@ -1,64 +1,86 @@
 import streamlit as st
 import pandas as pd
 from io import StringIO
+import re
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Sistema de Gestão Financeira & RH", layout="wide")
+st.set_page_config(page_title="Sistema de Conferência Financeira", layout="wide")
+st.title("📊 Sistema Financeiro Integrado")
 
-# --- ESTILIZAÇÃO CSS ---
-st.markdown("""
-<style>
-    .dataframe {font-size: 13px !important;}
-    th, td {text-align: center !important;}
-    th {background-color: #f0f2f6;}
-    /* Ajuste para as abas */
-    .stTabs [data-baseweb="tab-list"] { gap: 24px; }
-    .stTabs [data-baseweb="tab"] { height: 50px; white-space: pre-wrap; background-color: #f0f2f6; border-radius: 4px 4px 0px 0px; gap: 1px; padding-top: 10px; padding-bottom: 10px; }
-    .stTabs [aria-selected="true"] { background-color: #ffffff; border-bottom: 2px solid #ff4b4b; }
-</style>
-""", unsafe_allow_html=True)
+# --- FUNÇÕES AUXILIARES (COMPARTILHADAS) ---
 
-st.title("📊 Painel de Gestão: Financeiro & RH")
+def clean_currency(value):
+    """
+    Converte strings de moeda (ex: '1.234,56' ou 'R$ 1.234,56') e floats para float puro.
+    Mais robusta para aceitar tanto formato CSV quanto Excel.
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    
+    if isinstance(value, str):
+        # Remove R$, espaços e quebras de linha
+        clean = value.replace('R$', '').replace(' ', '').strip()
+        
+        # Lógica para formato brasileiro (milhar com ponto, decimal com vírgula)
+        if ',' in clean and '.' in clean:
+             clean = clean.replace('.', '').replace(',', '.')
+        elif ',' in clean:
+             clean = clean.replace(',', '.')
+        
+        try:
+            return float(clean)
+        except ValueError:
+            return 0.0
+    return 0.0
 
-# --- FUNÇÕES UTILITÁRIAS ---
-def clean_currency(x):
-    """Converte strings de moeda (ex: '1.234,56') para float."""
-    if isinstance(x, str):
-        # Remove ponto de milhar e substitui vírgula decimal por ponto
-        return float(x.replace('.', '').replace(',', '.'))
-    return float(x)
+def extract_os(text):
+    """Extrai padrões de OS como 001-67495-42 de um texto."""
+    if not isinstance(text, str):
+        return None
+    # Procura padrão XXX-XXXXX-XX ou similar
+    match = re.search(r'(\d{3}-\d{4,6}-\d{1,3})', text)
+    if match:
+        return match.group(1)
+    return None
+
+def find_header_row(df):
+    """Tenta encontrar a linha de cabeçalho no Excel procurando por 'NOME' e 'VALOR'."""
+    for i in range(min(20, len(df))):  # Procura nas primeiras 20 linhas
+        row_values = [str(v).upper() for v in df.iloc[i].values]
+        if 'NOME' in row_values and 'VALOR' in row_values:
+            return i
+    return 0 # Padrão se não achar
 
 # --- CRIAÇÃO DAS ABAS ---
-tab_caixa, tab_audit = st.tabs(["💰 Conferência de Caixa", "📋 Auditoria Salarial (RH)"])
+tab1, tab2 = st.tabs(["📂 Consolidação de Extratos (CSV)", "🔍 Conferência de Caixas (Excel vs CSV)"])
 
 # ==============================================================================
-# ABA 1: CONFERÊNCIA DE CAIXA
+# ABA 1: CONSOLIDAÇÃO (Seu código original)
 # ==============================================================================
-with tab_caixa:
-    st.header("Conferência de Caixa - Consolidação de Extratos")
-    st.markdown("---")
+with tab1:
+    st.header("Consolidação de Extratos")
+    st.markdown("Faça o upload de múltiplos arquivos CSV de extrato para gerar um relatório unificado.")
 
-    uploaded_files_caixa = st.file_uploader(
+    uploaded_files = st.file_uploader(
         "Faça o upload dos arquivos CSV (Extratos)", 
         accept_multiple_files=True, 
         type="csv",
-        key="upload_caixa"
+        key="upload_tab1"
     )
 
-    if uploaded_files_caixa:
+    if uploaded_files:
         all_data = []
         
-        for uploaded_file in uploaded_files_caixa:
+        for uploaded_file in uploaded_files:
             try:
-                # Ler o conteúdo do arquivo com encoding latin1 (padrão de sistemas antigos)
+                # Ler o conteúdo do arquivo com encoding 'latin1'
                 stringio = StringIO(uploaded_file.getvalue().decode("latin1"))
                 lines = stringio.readlines()
                 
-                # Pula arquivos que não têm cabeçalho suficiente
                 if len(lines) < 11:
                     continue
 
-                # 1. Extrair Credencial (Geralmente na linha 9, coluna B)
+                # 1. Extrair Credencial
                 try:
                     line_b9 = lines[8].strip().split(';')
                     if len(line_b9) > 1:
@@ -68,7 +90,7 @@ with tab_caixa:
                 except Exception:
                     credencial = "Erro Leitura"
 
-                # 2. Ler os dados (Cabeçalho costuma estar na linha 11)
+                # 2. Ler os dados
                 data_content = "".join(lines[10:])
                 df = pd.read_csv(StringIO(data_content), sep=';')
                 
@@ -93,89 +115,191 @@ with tab_caixa:
                 st.error(f"Erro ao processar arquivo {uploaded_file.name}: {e}")
 
         if all_data:
-            # Juntar todos os dataframes
             df_final = pd.concat(all_data, ignore_index=True)
 
-            # 4. Agrupar por Credencial e OS (Somar Valor)
-            # Agrupa para somar valores de mesma OS na mesma credencial
+            # Agrupar
             df_grouped = df_final.groupby(['Credencial', 'Cod O.S.', 'Nome'])['Valor'].sum().reset_index()
 
-            st.success(f"{len(uploaded_files_caixa)} arquivos processados com sucesso!")
+            st.success(f"{len(uploaded_files)} arquivos processados com sucesso!")
             
-            # Layout de colunas para Resumo e Botão de Download
-            col1, col2 = st.columns([1, 1])
+            # Resumo por Área
+            st.subheader("Resumo por Área (Credencial)")
+            resumo_area = df_grouped.groupby('Credencial')['Valor'].sum().reset_index()
+            st.dataframe(resumo_area.style.format({"Valor": "R$ {:,.2f}"}))
+
+            # Detalhado
+            st.subheader("Detalhamento por OS")
+            st.dataframe(df_grouped.style.format({"Valor": "R$ {:,.2f}"}))
             
-            with col1:
-                st.subheader("Resumo por Área (Credencial)")
-                resumo_area = df_grouped.groupby('Credencial')['Valor'].sum().reset_index()
-                st.dataframe(resumo_area.style.format({"Valor": "R$ {:,.2f}"}), use_container_width=True)
-
-            with col2:
-                st.subheader("Exportação")
-                st.write("Baixe a planilha completa para análise detalhada.")
-                csv = df_grouped.to_csv(index=False, sep=';', decimal=',').encode('latin1')
-                st.download_button(
-                    label="📥 Baixar Planilha Consolidada (CSV)",
-                    data=csv,
-                    file_name="extratos_consolidados.csv",
-                    mime="text/csv",
-                )
-
-            st.markdown("### Detalhamento por O.S.")
-            st.dataframe(df_grouped.style.format({"Valor": "R$ {:,.2f}"}), use_container_width=True)
+            # Download
+            csv = df_grouped.to_csv(index=False, sep=';', decimal=',').encode('latin1')
+            st.download_button(
+                label="Baixar Planilha Consolidada",
+                data=csv,
+                file_name="extratos_consolidados.csv",
+                mime="text/csv",
+            )
+            
+            # Salvar no session_state para uso opcional na outra aba
+            st.session_state['df_extratos_consolidado'] = df_grouped
             
         else:
             st.warning("Nenhum dado válido foi encontrado nos arquivos enviados.")
 
 # ==============================================================================
-# ABA 2: AUDITORIA SALARIAL
+# ABA 2: CONFERÊNCIA (O novo código)
 # ==============================================================================
-with tab_audit:
-    st.header("Análise Crítica: Auditoria Trabalhista (2025)")
-    st.markdown("---")
-    
-    # Texto formatado com base na análise do documento
+with tab2:
+    st.header("Conferência: Caixas Individuais vs Resumo")
     st.markdown("""
-    ### **RELATÓRIO DE AUDITORIA INTERNA TRABALHISTA – AC 970**
-    **Referência:** Exercício 2025 (Janeiro a Dezembro)  
-    **Data:** 09 de Dezembro de 2025
-
-    #### 1. OBJETIVO
-    O presente relatório apresenta os resultados da auditoria sobre a folha de pagamentos, verificando a conformidade dos reajustes salariais (dissídios) e identificando inconsistências financeiras.
-
-    #### 2. CONSTATAÇÕES POR CATEGORIA SINDICAL
-
-    **2.1. Sindicato da Saúde de Rio Claro**
-    * **Ausência de Aplicação do Reajuste (Competência 10/2025):** Identificada em 11 colaboradores (incluindo *Aline Moraes, Caroline Alves, Elaine Cristina*), que não receberam o dissídio devido.
-    * **Pagamentos Realizados a Maior (Competência 08/2025):** Diversos colaboradores (ex: *Flavia Furlan, Denise Gemina*) receberam diferenças de dissídio acima do cálculo correto, gerando um crédito indevido (passivo para o colaborador).
-    * **Pagamento Indevido:** *Vanessa Alves de Souza* teve dissídio aplicado incorretamente, pois sua promoção ocorreu após a data-base.
-
-    **2.2. Enfermagem (SEESP)**
-    * **Situação Crítica:** Categoria sem reajuste desde 2023 devido a falhas no acompanhamento sindical.
-    * **Passivo Acumulado a Regularizar:**
-        * **Suelen:** R$ 7.853,31
-        * **Elvira:** R$ 7.288,70
-
-    **2.3. Farmacêuticos (SINFAR)**
-    * **Vanusa:** Pendente reajuste de 10/2024 a 02/2025 (Total: R$ 709,35).
-    * **Juliana Brito:** Pendente diferença residual de 09/2025 (Total: R$ 141,87).
-
-    **2.4. Biomédicos (SINBIESP)**
-    * Ausência de reajuste em 10/2025 para **Lucas** (R$ 212,96) e **Rodrigo** (R$ 349,08).
-
-    ---
-
-    #### 3. RESUMO FINANCEIRO
-    | Categoria | Valor (R$) | Descrição |
-    | :--- | :--- | :--- |
-    | **A Regularizar (Pagar)** | **R$ 18.323,90** | Valor total devido aos funcionários em Dez/2025. |
-    | **Pago Indevidamente** | **R$ 1.429,51** | Valor pago a maior (erro de cálculo anterior). |
-
-    #### 4. CAUSA RAIZ E PLANO DE AÇÃO
-    **Causas:** Descontinuidade no monitoramento das convenções coletivas (falha de comunicação com contabilidade externa e controle interno).
-    
-    **Ações Imediatas:**
-    1.  **Monitoramento:** Implementar alertas automáticos no sistema *Sysquali* (30 dias antes da data-base).
-    2.  **Regularização:** Processar os pagamentos pendentes na folha de Dezembro/2025.
-    3.  **Gestão de Passivo:** Analisar juridicamente a viabilidade de estorno ou absorção dos valores pagos a maior.
+    Compare os **arquivos de Caixa (Excel)** com o **Resumo Consolidado (CSV)**.
+    O sistema extrai a OS do nome no Excel e compara os valores.
     """)
+    
+    col_up1, col_up2 = st.columns(2)
+    
+    with col_up1:
+        file_csv_conf = st.file_uploader("1. Carregar Resumo (CSV)", type=["csv"], key="upload_csv_tab2")
+        # Opção de usar o arquivo gerado na Aba 1
+        if 'df_extratos_consolidado' in st.session_state and not file_csv_conf:
+            st.info("💡 Você pode usar o arquivo gerado na Aba 1 ou fazer upload de um novo.")
+            if st.checkbox("Usar Consolidação gerada na Aba 1"):
+                df_resumo_input = st.session_state['df_extratos_consolidado']
+            else:
+                df_resumo_input = None
+        elif file_csv_conf:
+            try:
+                df_resumo_input = pd.read_csv(file_csv_conf, sep=';', encoding='latin-1')
+            except:
+                df_resumo_input = pd.read_csv(file_csv_conf, sep=';', encoding='utf-8')
+        else:
+            df_resumo_input = None
+
+    with col_up2:
+        files_excel_conf = st.file_uploader("2. Carregar Caixas (Excel)", type=["xlsx"], accept_multiple_files=True, key="upload_excel_tab2")
+
+    # Processamento da Conferência
+    if df_resumo_input is not None and files_excel_conf:
+        
+        # Preparar dados do CSV (Resumo)
+        df_resumo = df_resumo_input.copy()
+        
+        # Tentar identificar colunas automaticamente
+        cols_os = [c for c in df_resumo.columns if 'O.S.' in c or 'OS' in c]
+        cols_val = [c for c in df_resumo.columns if 'Valor' in c or 'VALOR' in c]
+
+        if not cols_os or not cols_val:
+            st.error("Não foi possível identificar as colunas 'OS' e 'Valor' no CSV.")
+        else:
+            col_os_csv = cols_os[0]
+            col_val_csv = cols_val[0]
+
+            df_resumo['OS_Limpa'] = df_resumo[col_os_csv].astype(str).str.strip()
+            df_resumo['Valor_Limpo'] = df_resumo[col_val_csv].apply(clean_currency)
+            
+            # Dicionário de referência {OS: Valor}
+            dict_resumo = pd.Series(df_resumo.Valor_Limpo.values, index=df_resumo.OS_Limpa).to_dict()
+            
+            st.success(f"CSV de Referência carregado: {len(df_resumo)} linhas.")
+            st.divider()
+
+            # Seleção da Aba do Excel
+            try:
+                xls_temp = pd.ExcelFile(files_excel_conf[0])
+                sheet_names = xls_temp.sheet_names
+                selected_sheet = st.selectbox("📅 Selecione a Aba do Excel (ex: OUTUBRO 2):", sheet_names)
+                
+                if st.button("Iniciar Conferência", type="primary"):
+                    
+                    st.write(f"### Resultados da Análise: {selected_sheet}")
+                    
+                    all_missing_in_csv = [] 
+                    all_os_processed_in_excel = set()
+
+                    for uploaded_file in files_excel_conf:
+                        try:
+                            # Ler a aba e encontrar cabeçalho
+                            df_temp = pd.read_excel(uploaded_file, sheet_name=selected_sheet, header=None)
+                            header_row_idx = find_header_row(df_temp)
+                            
+                            df_caixa = pd.read_excel(uploaded_file, sheet_name=selected_sheet, header=header_row_idx)
+                            df_caixa.columns = [str(c).upper().strip() for c in df_caixa.columns]
+                            
+                            if 'NOME' not in df_caixa.columns or 'VALOR' not in df_caixa.columns:
+                                st.warning(f"⚠️ {uploaded_file.name}: Colunas 'NOME' ou 'VALOR' não encontradas.")
+                                continue
+
+                            divergencias = []
+                            conferem = []
+                            faltantes_no_csv = []
+
+                            for index, row in df_caixa.iterrows():
+                                nome_completo = str(row['NOME'])
+                                valor_caixa = clean_currency(row['VALOR'])
+                                
+                                if valor_caixa == 0: continue
+
+                                os_encontrada = extract_os(nome_completo)
+
+                                if os_encontrada:
+                                    all_os_processed_in_excel.add(os_encontrada)
+                                    
+                                    if os_encontrada in dict_resumo:
+                                        valor_resumo = dict_resumo[os_encontrada]
+                                        diferenca = valor_caixa - valor_resumo
+                                        
+                                        if abs(diferenca) > 0.02:
+                                            divergencias.append({
+                                                "OS": os_encontrada,
+                                                "Nome": nome_completo,
+                                                "Valor Caixa": valor_caixa,
+                                                "Valor Resumo": valor_resumo,
+                                                "Diferença": diferenca
+                                            })
+                                        else:
+                                            conferem.append(os_encontrada)
+                                    else:
+                                        # No Excel, mas não no CSV
+                                        faltantes_no_csv.append({
+                                            "OS": os_encontrada,
+                                            "Nome": nome_completo,
+                                            "Valor": valor_caixa
+                                        })
+
+                            # Exibição por arquivo
+                            with st.expander(f"📁 {uploaded_file.name}", expanded=True):
+                                c1, c2, c3 = st.columns(3)
+                                c1.metric("Conferem", len(conferem))
+                                c2.metric("Divergentes", len(divergencias))
+                                c3.metric("Só no Caixa (Faltam no CSV)", len(faltantes_no_csv))
+
+                                if divergencias:
+                                    st.error("🚨 **Divergências de Valor:**")
+                                    st.dataframe(pd.DataFrame(divergencias).style.format({
+                                        "Valor Caixa": "R$ {:,.2f}", "Valor Resumo": "R$ {:,.2f}", "Diferença": "R$ {:,.2f}"
+                                    }))
+                                
+                                if faltantes_no_csv:
+                                    st.warning("❌ **Constam no Caixa, mas NÃO no Resumo:**")
+                                    st.dataframe(pd.DataFrame(faltantes_no_csv))
+                        
+                        except Exception as e:
+                            st.error(f"Erro ao ler {uploaded_file.name}: verifique se a aba '{selected_sheet}' existe neste arquivo.")
+
+                    # Análise Inversa (O que tem no CSV e ninguém lançou no Excel)
+                    st.divider()
+                    st.subheader("🔍 Auditoria Inversa")
+                    st.markdown("OS que constam no **CSV Resumo** mas **não apareceram** em nenhum Excel selecionado.")
+                    
+                    missing_in_excel = []
+                    for os_csv, val_csv in dict_resumo.items():
+                        if os_csv not in all_os_processed_in_excel:
+                            missing_in_excel.append({"OS": os_csv, "Valor CSV": val_csv})
+                    
+                    if missing_in_excel:
+                        st.dataframe(pd.DataFrame(missing_in_excel))
+                    else:
+                        st.success("Tudo certo! Todas as OS do CSV foram encontradas nos caixas.")
+
+            except Exception as e:
+                st.error(f"Erro ao ler arquivo Excel inicial: {e}")
