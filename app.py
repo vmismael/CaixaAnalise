@@ -65,7 +65,7 @@ with tab1:
     col1, col2 = st.columns(2)
     
     with col1:
-        st.info("📄 **Extratos Padrão**)
+        st.info("📄 **Extratos Padrão**")
         uploaded_files = st.file_uploader(
             "Solte os arquivos padrão aqui", 
             accept_multiple_files=True, 
