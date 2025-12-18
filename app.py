@@ -65,7 +65,7 @@ with tab1:
     col1, col2 = st.columns(2)
     
     with col1:
-        st.info("📄 **Extratos Padrão** (Sistema Antigo)")
+        st.info("📄 **Extratos Padrão**)
         uploaded_files = st.file_uploader(
             "Solte os arquivos padrão aqui", 
             accept_multiple_files=True, 
@@ -74,7 +74,7 @@ with tab1:
         )
 
     with col2:
-        st.warning("📑 **Extratos Externos** (Novo Modelo)")
+        st.warning("📑 **Coleta Externa**")
         uploaded_files_ext = st.file_uploader(
             "Solte os arquivos 'Externa' aqui (OS na Col B, Valor na Col F)", 
             accept_multiple_files=True, 
