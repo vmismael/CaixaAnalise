@@ -22,6 +22,7 @@ def clean_currency(value):
         clean = value.replace('R$', '').replace(' ', '').strip()
         
         # Lógica para formato brasileiro (milhar com ponto, decimal com vírgula)
+        # Ex: 1.000,00 -> remove ponto, troca virgula por ponto
         if ',' in clean and '.' in clean:
              clean = clean.replace('.', '').replace(',', '.')
         elif ',' in clean:
@@ -55,7 +56,7 @@ def find_header_row(df):
 tab1, tab2 = st.tabs(["📂 Consolidação de Extratos (CSV)", "🔍 Conferência de Caixas (Excel vs CSV)"])
 
 # ==============================================================================
-# ABA 1: CONSOLIDAÇÃO (CÓDIGO ORIGINAL MANTIDO)
+# ABA 1: CONSOLIDAÇÃO
 # ==============================================================================
 with tab1:
     st.header("Consolidação de Extratos")
@@ -133,6 +134,11 @@ with tab1:
                     if df_ext.shape[1] >= 6:
                         df_temp = pd.DataFrame()
                         
+                        # Mapeamento Solicitado:
+                        # OS -> Coluna B (índice 1)
+                        # Valor -> Coluna F (índice 5)
+                        # Nome -> Coluna A (índice 0) ex: COLETA EXTERNA
+                        
                         df_temp['Cod O.S.'] = df_ext.iloc[:, 1]
                         df_temp['Valor'] = df_ext.iloc[:, 5].apply(clean_currency)
                         df_temp['Nome'] = df_ext.iloc[:, 0]
@@ -184,7 +190,7 @@ with tab1:
             st.warning("Nenhum dado válido encontrado.")
 
 # ==============================================================================
-# ABA 2: CONFERÊNCIA (LÓGICA ALTERADA AQUI)
+# ABA 2: CONFERÊNCIA
 # ==============================================================================
 with tab2:
     st.header("Conferência: Caixas Individuais vs Resumo")
@@ -236,19 +242,11 @@ with tab2:
                 sheet_names = xls_temp.sheet_names
                 selected_sheet = st.selectbox("📅 Selecione a Aba do Excel:", sheet_names)
                 
-                # --- BOTÃO PARA INICIAR (ARMAZENA EM SESSION STATE) ---
-                if st.button("🚀 Iniciar/Reiniciar Conferência", type="primary"):
-                    
-                    # Limpa estados anteriores
-                    st.session_state['conferencia_divergencias'] = []
-                    st.session_state['conferencia_so_no_caixa'] = []
-                    st.session_state['conferencia_auditoria'] = []
-                    
+                if st.button("Iniciar Conferência", type="primary"):
+                    st.write(f"### Resultados: {selected_sheet}")
                     all_os_processed_in_excel = set()
-                    
-                    progress_bar = st.progress(0)
 
-                    for i, uploaded_file in enumerate(files_excel_conf):
+                    for uploaded_file in files_excel_conf:
                         try:
                             df_temp = pd.read_excel(uploaded_file, sheet_name=selected_sheet, header=None)
                             header_row_idx = find_header_row(df_temp)
@@ -259,119 +257,54 @@ with tab2:
                                 st.warning(f"⚠️ {uploaded_file.name}: Colunas não encontradas.")
                                 continue
 
+                            divergencias = []
+                            conferem = []
+                            faltantes_no_csv = []
+
                             for index, row in df_caixa.iterrows():
                                 nome_completo = str(row['NOME'])
                                 valor_caixa = clean_currency(row['VALOR'])
                                 if valor_caixa == 0: continue
 
                                 os_encontrada = extract_os(nome_completo)
-                                
                                 if os_encontrada:
                                     all_os_processed_in_excel.add(os_encontrada)
-                                    
                                     if os_encontrada in dict_resumo:
-                                        # CASO 1: Está no resumo, verificando valor
                                         valor_resumo = dict_resumo[os_encontrada]
                                         diferenca = valor_caixa - valor_resumo
-                                        
                                         if abs(diferenca) > 0.02:
-                                            st.session_state['conferencia_divergencias'].append({
-                                                "Arquivo": uploaded_file.name,
-                                                "OS": os_encontrada, 
-                                                "Nome": nome_completo, 
-                                                "Valor Caixa": valor_caixa, 
-                                                "Valor Resumo": valor_resumo, 
-                                                "Diferença": diferenca
-                                            })
+                                            divergencias.append({"OS": os_encontrada, "Nome": nome_completo, "Valor Caixa": valor_caixa, "Valor Resumo": valor_resumo, "Diferença": diferenca})
+                                        else:
+                                            conferem.append(os_encontrada)
                                     else:
-                                        # CASO 2: Tem OS, mas não está no resumo (Só no Caixa)
-                                        st.session_state['conferencia_so_no_caixa'].append({
-                                            "Arquivo": uploaded_file.name,
-                                            "OS": os_encontrada, 
-                                            "Nome": nome_completo, 
-                                            "Valor": valor_caixa,
-                                            "Incluir": False # Checkbox começa desmarcado
-                                        })
+                                        faltantes_no_csv.append({"OS": os_encontrada, "Nome": nome_completo, "Valor": valor_caixa})
+
+                            with st.expander(f"📁 {uploaded_file.name}", expanded=True):
+                                c1, c2, c3 = st.columns(3)
+                                c1.metric("Conferem", len(conferem))
+                                c2.metric("Divergentes", len(divergencias))
+                                c3.metric("Só no Caixa", len(faltantes_no_csv))
+
+                                if divergencias:
+                                    st.dataframe(pd.DataFrame(divergencias).style.format({"Valor Caixa": "R$ {:.2f}", "Valor Resumo": "R$ {:.2f}", "Diferença": "R$ {:.2f}"}))
+                                if faltantes_no_csv:
+                                    st.warning("Só no Caixa (Não está no CSV):")
+                                    st.dataframe(pd.DataFrame(faltantes_no_csv))
+                        
                         except Exception as e:
                             st.error(f"Erro ao ler {uploaded_file.name}: {e}")
-                        
-                        progress_bar.progress((i + 1) / len(files_excel_conf))
-                    
-                    # Auditoria (O que está no CSV e ninguém achou no Excel)
+
+                    st.divider()
+                    st.subheader("🔍 Auditoria Inversa (Sobra no CSV)")
+                    missing_in_excel = []
                     for os_csv, val_csv in dict_resumo.items():
                         if os_csv not in all_os_processed_in_excel:
-                            st.session_state['conferencia_auditoria'].append({"OS": os_csv, "Valor CSV": val_csv})
+                            missing_in_excel.append({"OS": os_csv, "Valor CSV": val_csv})
                     
-                    st.session_state['processamento_ok'] = True
-
-                # --- EXIBIÇÃO DOS RESULTADOS ---
-                if st.session_state.get('processamento_ok'):
-                    st.divider()
-                    
-                    # 1. DIVERGÊNCIAS (AUTOMÁTICO)
-                    st.subheader("1. Divergências de Preço (Somadas Automaticamente)")
-                    df_div = pd.DataFrame(st.session_state['conferencia_divergencias'])
-                    total_divergencias = 0.0
-                    
-                    if not df_div.empty:
-                        st.dataframe(df_div.style.format({"Valor Caixa": "R$ {:.2f}", "Valor Resumo": "R$ {:.2f}", "Diferença": "R$ {:.2f}"}))
-                        total_divergencias = df_div['Diferença'].sum()
+                    if missing_in_excel:
+                        st.dataframe(pd.DataFrame(missing_in_excel))
                     else:
-                        st.success("Nenhuma divergência de valor encontrada nas OS correspondentes.")
-
-                    # 2. SÓ NO CAIXA (SELEÇÃO MANUAL)
-                    st.subheader("2. Valores 'Só no Caixa' (Selecione para Incluir)")
-                    st.caption("Estes valores não foram encontrados no CSV. Marque a caixa 'Incluir' se deseja somá-los à diferença total.")
-                    
-                    total_extras = 0.0
-                    df_extras_list = st.session_state['conferencia_so_no_caixa']
-                    
-                    if df_extras_list:
-                        df_extras = pd.DataFrame(df_extras_list)
-                        
-                        # Tabela Editável
-                        edited_df = st.data_editor(
-                            df_extras,
-                            column_config={
-                                "Incluir": st.column_config.CheckboxColumn(
-                                    "Incluir?",
-                                    help="Marque para somar este valor ao total.",
-                                    default=False,
-                                ),
-                                "Valor": st.column_config.NumberColumn("Valor", format="R$ %.2f")
-                            },
-                            disabled=["Arquivo", "OS", "Nome", "Valor"],
-                            hide_index=True,
-                            key="tabela_extras"
-                        )
-                        
-                        if not edited_df.empty:
-                            total_extras = edited_df[edited_df['Incluir'] == True]['Valor'].sum()
-                    else:
-                        st.info("Nenhum item exclusivo do caixa encontrado.")
-
-                    # 3. TOTALIZADOR FINAL
-                    st.divider()
-                    total_geral = total_divergencias + total_extras
-                    
-                    col_t1, col_t2, col_t3 = st.columns(3)
-                    
-                    col_t1.metric("Diferença Preços", f"R$ {total_divergencias:,.2f}")
-                    col_t2.metric("Extras Selecionados", f"R$ {total_extras:,.2f}")
-                    
-                    col_t3.markdown(f"""
-                    <div style="background-color: #f0f2f6; border-radius: 10px; padding: 15px; text-align: center; border: 1px solid #ccc;">
-                        <h3 style="margin: 0; color: #555;">DIFERENÇA TOTAL</h3>
-                        <h1 style="margin: 0; color: #d9534f;">R$ {total_geral:,.2f}</h1>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                    # 4. AUDITORIA (RODAPÉ)
-                    with st.expander("Ver itens que faltam no Excel (Estão no CSV mas não no Caixa)"):
-                        if st.session_state['conferencia_auditoria']:
-                            st.dataframe(pd.DataFrame(st.session_state['conferencia_auditoria']))
-                        else:
-                            st.success("Todos os itens do CSV foram encontrados nos arquivos de caixa.")
+                        st.success("Tudo bateu!")
 
             except Exception as e:
-                st.error(f"Erro geral no processamento: {e}")
+                st.error(f"Erro geral: {e}")
